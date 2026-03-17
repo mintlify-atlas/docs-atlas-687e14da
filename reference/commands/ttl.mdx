@@ -1,0 +1,52 @@
+---
+title: "TTL"
+description: "Get the remaining time-to-live in seconds for a key."
+---
+
+## Syntax
+
+```text
+TTL key
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The key to inspect.
+</ParamField>
+
+## Returns
+
+| Value | Meaning |
+| ----- | ------- |
+| Positive integer | Seconds remaining until the key expires. |
+| `-1` | Key exists but has no expiration (persistent key). |
+| `-2` | Key does not exist, or it existed but has already expired and was removed. |
+
+<Note>
+  These return value semantics are compatible with Redis `TTL` behavior. `-1` means "lives forever"; `-2` means "not found or already gone". Applications can treat `-2` the same way they treat a missing key.
+</Note>
+
+## Behavior
+
+- If the key has a TTL set and that TTL has elapsed when `TTL` is called, the key is lazily expired (deleted) and `-2` is returned.
+- The remaining time is calculated as `expires_at - current_time` using wall-clock seconds.
+
+## Examples
+
+```text
+SET session abc EX 60
+OK
+
+TTL session
+58
+
+SET permanent value
+OK
+
+TTL permanent
+-1
+
+TTL missing
+-2
+```

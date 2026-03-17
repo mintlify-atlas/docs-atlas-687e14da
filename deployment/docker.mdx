@@ -1,0 +1,106 @@
+---
+title: "Docker deployment"
+description: "Run RadishDB as a Docker container with persistent storage."
+---
+
+RadishDB is published on Docker Hub and runs as a single container with persistent storage backed by a named volume.
+
+<Steps>
+  <Step title="Pull the image">
+    Pull the latest RadishDB image from Docker Hub:
+
+    ```bash
+    docker pull piee314/radishdb:latest
+    ```
+  </Step>
+
+  <Step title="Run the container">
+    Start RadishDB in detached mode with port forwarding and a persistent volume:
+
+    ```bash
+    docker run -d \
+      --name radishdb \
+      -p 6379:6379 \
+      -v radish-data:/app/aof \
+      piee314/radishdb:latest
+    ```
+
+    Each flag serves a specific purpose:
+
+    | Flag | Purpose |
+    |------|---------|
+    | `-d` | Run the container in detached (background) mode |
+    | `--name radishdb` | Assign a memorable name so you can reference the container by name |
+    | `-p 6379:6379` | Map port 6379 on your host to port 6379 in the container |
+    | `-v radish-data:/app/aof` | Mount the named volume `radish-data` at `/app/aof` inside the container, where RadishDB writes its AOF file |
+  </Step>
+
+  <Step title="Verify the container is running">
+    Confirm the container started successfully:
+
+    ```bash
+    docker ps
+    ```
+
+    Tail the container logs to check for startup messages:
+
+    ```bash
+    docker logs radishdb
+    ```
+  </Step>
+
+  <Step title="Connect and test">
+    Use `nc` (netcat) to connect to the server and issue a command:
+
+    ```bash
+    nc localhost 6379
+    ```
+
+    Once connected, send a command:
+
+    ```text
+    SET foo bar
+    ```
+
+    You should receive an `OK` response.
+  </Step>
+
+  <Step title="Stop and remove the container">
+    Stop the running container:
+
+    ```bash
+    docker stop radishdb
+    ```
+
+    Remove the container (the volume and its data are retained):
+
+    ```bash
+    docker rm radishdb
+    ```
+  </Step>
+</Steps>
+
+## Volume management
+
+RadishDB persists all writes to the named volume `radish-data`. You can inspect it at any time:
+
+```bash
+docker volume ls
+```
+
+```bash
+docker volume inspect radish-data
+```
+
+<Note>
+  RadishDB writes its append-only file to `/app/aof/radish.aof` inside the container. Mounting a named volume at `/app/aof` ensures data survives container stops, removals, and upgrades. Remove the volume explicitly with `docker volume rm radish-data` only when you want to discard all stored data.
+</Note>
+
+## How the image is built
+
+RadishDB uses a multi-stage Docker build to keep the final image small:
+
+- **Build stage** — uses the `gcc:13` image to compile the RadishDB binary from source via `make`.
+- **Runtime stage** — copies only the compiled binary into a minimal `debian:bookworm-slim` image. No compiler toolchain is included in the shipped image.
+
+This approach produces a lean, production-ready container with a fast startup time.

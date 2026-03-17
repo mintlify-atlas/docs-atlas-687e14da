@@ -1,0 +1,67 @@
+---
+title: "SAVE / LOAD"
+description: "Save a binary snapshot to disk or load a snapshot file to restore state."
+---
+
+## Syntax
+
+```text
+SAVE filename
+LOAD filename
+```
+
+## Parameters
+
+<ParamField path="filename" type="string" required>
+  Path to the snapshot file. RadishDB uses the `.rdbx` binary format. If the filename you provide does not already end in `.rdbx`, the extension is appended automatically (SAVE only).
+</ParamField>
+
+## Returns
+
+`OK` on success. An error string in the following cases:
+
+| Command | Error | Cause |
+| ------- | ----- | ----- |
+| `SAVE` | `(error) could not write file` | The file could not be opened or written. |
+| `LOAD` | `(error) could not open file` | The specified file does not exist or cannot be read. |
+| `LOAD` | `(error) invalid RDBX file` | The file does not start with the expected RDBX magic header. |
+
+## Behavior
+
+### SAVE
+
+Serializes the current in-memory hash table to a binary `.rdbx` snapshot file. The snapshot captures all keys, values, and expiration timestamps at the moment the command is run.
+
+### LOAD
+
+Reads a `.rdbx` snapshot file and replaces the entire in-memory state with the contents of the file. The TTL expiration system is re-initialized after loading.
+
+<Warning>
+  `LOAD` replaces all current in-memory state. Any keys present before the command is run that are not in the snapshot file will be permanently lost.
+</Warning>
+
+<Note>
+  `SAVE` and `LOAD` operate on the binary RDBX snapshot format and are independent of the append-only file (AOF) log. Saving a snapshot does not compact or modify the AOF, and loading a snapshot does not replay it.
+</Note>
+
+## Examples
+
+```text
+SET name radish
+OK
+
+SAVE backup.rdbx
+OK
+
+DEL name
+1
+
+GET name
+(nil)
+
+LOAD backup.rdbx
+OK
+
+GET name
+radish
+```

@@ -1,0 +1,51 @@
+---
+title: "BENCH"
+description: "Run a benchmark that performs N sequential SET operations and reports throughput."
+---
+
+## Syntax
+
+```text
+BENCH n
+```
+
+## Parameters
+
+<ParamField path="n" type="integer" required>
+  Number of `SET` operations to perform. Must be a positive integer.
+</ParamField>
+
+## Returns
+
+A string reporting the number of entries inserted and the elapsed wall-clock time in seconds.
+
+```text
+Inserted 10000 entries in 0.01 seconds.
+```
+
+## Behavior
+
+- Performs `n` `SET` operations with auto-generated keys (`key0`, `key1`, ..., `keyN-1`) and values (`value0`, `value1`, ..., `valueN-1`).
+- Measures elapsed time using `CLOCK_MONOTONIC` for high-resolution wall-clock accuracy.
+- Keys are written without a TTL (they do not expire).
+- The hash table resizes automatically as load factor thresholds are crossed during the benchmark, so results reflect real-world resizing behavior.
+
+<Note>
+  `BENCH` writes directly to the hash table without appending to the AOF log. Benchmark keys will not be replayed on restart. If you are running benchmarks against a production instance and want to avoid polluting the AOF, no additional steps are needed — `BENCH` does not affect the log.
+</Note>
+
+## Use cases
+
+- Measuring baseline insertion throughput on a given host.
+- Observing hash table resize behavior under increasing load.
+- Comparing performance across different build configurations.
+
+## Examples
+
+```text
+BENCH 10000
+Inserted 10000 entries in 0.01 seconds.
+
+BENCH 100000
+Inserted 100000 entries in 0.09 seconds.
+```

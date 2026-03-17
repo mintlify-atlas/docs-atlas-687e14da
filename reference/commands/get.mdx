@@ -1,0 +1,39 @@
+---
+title: "GET"
+description: "Retrieve the value stored at a key."
+---
+
+## Syntax
+
+```text
+GET key
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The key whose value you want to retrieve.
+</ParamField>
+
+## Returns
+
+The string value stored at `key`, or `(nil)` if the key does not exist or has expired.
+
+## Behavior
+
+- If the key exists and has not expired, its value is returned.
+- If the key has a TTL set and that TTL has elapsed, `GET` performs **passive expiration**: the key is deleted from the hash table and `(nil)` is returned. No separate sweep is required for the key to be reclaimed on read.
+- If the key was never set, `(nil)` is returned.
+
+## Examples
+
+```text
+SET name radish
+OK
+
+GET name
+radish
+
+GET missing
+(nil)
+```

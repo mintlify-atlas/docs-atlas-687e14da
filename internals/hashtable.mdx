@@ -1,0 +1,153 @@
+---
+title: "Hash table internals"
+description: "How RadishDB's storage engine works: hash function, separate chaining, resizing, and memory management."
+---
+
+RadishDB's entire keyspace lives in a single in-memory hash table. Understanding its layout helps you reason about memory usage, TTL behavior, and when resizes occur.
+
+## Data structures
+
+Three structs form the storage engine.
+
+### Entry
+
+Each key-value pair is stored as an `Entry` node on the heap:
+
+```c
+typedef struct Entry {
+  char *key;
+  char *value;
+  time_t expires_at;
+  struct Entry *next;
+} Entry;
+```
+
+- `key` and `value` are heap-allocated copies (via `strdup`). RadishDB owns them and frees them on deletion.
+- `expires_at` is a Unix timestamp. A value of `0` means the key has no expiry.
+- `next` links to the next entry in the same bucket chain (separate chaining).
+
+### HashTable
+
+```c
+typedef struct HashTable {
+  Entry **buckets;
+  size_t size;
+  int count;
+  int resizes;
+} HashTable;
+```
+
+| Field | Description |
+|---|---|
+| `buckets` | Array of `Entry*` pointers, one per bucket slot |
+| `size` | Total number of bucket slots currently allocated |
+| `count` | Number of live key-value pairs |
+| `resizes` | Cumulative number of resize operations performed |
+
+### Info
+
+`ht_info` returns a snapshot of hash table health:
+
+```c
+typedef struct Info {
+  int keys;           // live key count
+  int keys_with_ttl;  // keys that have an expiry set
+  int expired_keys;   // keys past their expiry (not yet lazily evicted)
+  int buckets;        // total bucket slots
+  float load_factor;  // keys / buckets
+  int max_chain;      // length of the longest collision chain
+  int resizes;        // total resize operations since creation
+} Info;
+```
+
+`max_chain` is the most useful indicator of hash quality — a value of 1 means every key lands in its own bucket.
+
+## Hash function
+
+RadishDB uses a djb2-style hash: start at seed `5381`, then for every character multiply the accumulator by 33 and add the character's byte value:
+
+```c
+unsigned long hash(const char *str) {
+  unsigned long hash = 5381;
+  for (int i = 0; str[i] != '\0'; i++) {
+    hash = hash * 33 + str[i];
+  }
+  return hash;
+}
+```
+
+The bucket index is `hash(key) % size`. This distributes short ASCII keys (typical Redis-style key names) evenly across the bucket array.
+
+## Separate chaining
+
+Every bucket slot holds the head of a singly-linked list of `Entry` nodes. When two keys hash to the same index they form a chain:
+
+```text
+buckets[3] → Entry{"user:1", ...} → Entry{"user:42", ...} → NULL
+buckets[7] → Entry{"session:99", ...} → NULL
+```
+
+New entries **prepend** to the chain (`new_entry->next = ht->buckets[index]`), making insertion O(1). Lookup and deletion walk the chain until the key matches.
+
+## Automatic resizing
+
+`ht_set` checks the load factor before every insert:
+
+```c
+float load = (float)ht->count / ht->size;
+if (load > 0.75f) {
+    ht_resize(ht, ht->size * 2);
+}
+```
+
+When the load factor exceeds **0.75**, the bucket array doubles. `ht_resize` allocates a new bucket array, rehashes every existing entry into it, frees the old array, and increments `resizes`.
+
+The load factor threshold of 0.75 is the same default used by Java's `HashMap` — it balances memory efficiency against chain length.
+
+## Function reference
+
+```c
+HashTable *ht_create(int size);
+void       ht_set(HashTable *ht, const char *key, const char *value, time_t expires_at);
+char      *ht_get(HashTable *ht, const char *key);
+int        ht_delete(HashTable *ht, const char *key);
+void       ht_resize(HashTable *ht, int new_size);
+long       ht_ttl(HashTable *ht, const char *key);
+Info       ht_info(HashTable *ht);
+void       ht_free(HashTable *ht);
+```
+
+**`ht_get` and `ht_ttl` perform lazy expiry.** If the key exists but `expires_at <= now`, both functions call `ht_delete` internally before returning `NULL` / `-2`.
+
+**`ht_ttl` return values:**
+- `>= 0` — seconds remaining until expiry
+- `-1` — key exists but has no expiry
+- `-2` — key does not exist (or was just expired)
+
+## Memory management
+
+`ht_set` copies keys and values with `strdup` — the caller's strings are never retained. `ht_delete` calls `free` on both `entry->key` and `entry->value` before freeing the node.
+
+`ht_free` walks every bucket chain and frees every node, then frees the bucket array and the `HashTable` struct itself:
+
+```c
+void ht_free(HashTable *ht) {
+  int size = ht->size;
+  for (int index = 0; index < size; index++) {
+    Entry *entry = ht->buckets[index];
+    while (entry != NULL) {
+      Entry *next = entry->next;
+      free(entry->key);
+      free(entry->value);
+      free(entry);
+      entry = next;
+    }
+  }
+  free(ht->buckets);
+  free(ht);
+}
+```
+
+<Note>
+RadishDB is single-threaded by design. There are no mutexes or lock primitives anywhere in the hash table implementation. All operations are safe only because only one thread ever touches the table at a time.
+</Note>

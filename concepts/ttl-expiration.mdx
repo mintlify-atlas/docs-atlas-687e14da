@@ -1,0 +1,113 @@
+---
+title: "TTL and expiration"
+description: "Per-key time-to-live with passive expiration on read and an active background sweeper."
+---
+
+RadishDB supports per-key expiration using Unix timestamps stored directly in each `Entry`. Expiration is handled two ways: **passively** on read, and **actively** by a periodic sweeper.
+
+## Setting a TTL
+
+Pass the `EX` option to `SET`:
+
+```text
+SET color red EX 10
+```
+
+This stores `time(NULL) + 10` in the `expires_at` field of the entry. A value of `0` means no expiry.
+
+## Querying remaining time
+
+```text
+TTL color
+```
+
+Return values:
+
+| Value | Meaning |
+|---|---|
+| `>= 0` | Seconds remaining until expiry |
+| `-1` | Key exists but has no TTL set |
+| `-2` | Key does not exist or has already expired |
+
+## Example session
+
+```text
+SET session abc123 EX 30
+OK
+
+TTL session
+28
+
+TTL session
+21
+
+GET session
+abc123
+
+# after 30 seconds...
+
+GET session
+(nil)
+
+TTL session
+-2
+```
+
+## Passive expiration
+
+When you call `GET` or `TTL`, `ht_get` and `ht_ttl` check whether the key has expired before returning:
+
+```c
+time_t cur_time = time(NULL);
+// inside the lookup loop:
+if (cur_time >= entry->expires_at && entry->expires_at != 0) {
+    ht_delete(ht, key);
+    return NULL; // or -2 for TTL
+}
+```
+
+Expired keys are deleted on the spot and the caller receives `(nil)`. This follows Redis-style semantics: an expired key is indistinguishable from a missing key.
+
+## Active expiration (sweeper)
+
+Passive expiration only cleans up keys that are actually accessed. Keys that expire and are never read again would accumulate in memory indefinitely. The active sweeper in `expires.c` prevents this.
+
+### expire_sweep
+
+```c
+void expire_sweep(HashTable *ht, size_t max_checks);
+```
+
+Each call scans up to `max_checks` entries across the bucket array, starting from a persistent cursor (`expire_cursor`). Any entry with a past `expires_at` is unlinked and freed immediately. The cursor advances across calls, so the sweeper makes progress through the entire table over time without scanning it all at once.
+
+### expire_init
+
+```c
+void expire_init(HashTable *ht);
+```
+
+Resets the cursor and the `expired_deleted` counter to zero. Called at startup and after `LOAD`.
+
+<Note>
+  RadishDB does not use a priority queue or sorted set for TTL. The sweeper
+  performs a linear scan capped by `max_checks`. This is simpler to implement
+  and correct, but means the sweeper does not prioritise keys that are
+  expiring soonest. For a database with millions of short-lived keys, a
+  heap-based approach would be more efficient — a deliberate tradeoff in this
+  implementation.
+</Note>
+
+## How expires_at is stored
+
+The `expires_at` field lives directly in the `Entry` struct:
+
+```c
+typedef struct Entry {
+  char          *key;
+  char          *value;
+  time_t         expires_at; // Unix timestamp; 0 = no expiry
+  struct Entry  *next;
+} Entry;
+```
+
+There is no separate expiry index. Both the passive check and the active sweep read this field in-place.

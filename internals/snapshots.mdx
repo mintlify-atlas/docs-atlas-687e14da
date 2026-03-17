@@ -1,0 +1,122 @@
+---
+title: "Snapshot (.rdbx) internals"
+description: "Binary snapshot format for full-state save and restore, independent of the AOF log."
+---
+
+A snapshot captures the entire hash table as a single binary file. Unlike the AOF log, which records every individual mutation, a snapshot encodes the current live state in one pass. You can use snapshots and AOF together — they are independent mechanisms.
+
+## API
+
+```c
+typedef enum {
+  RDB_OK = 1,
+  RDB_ERR_OPEN,   // fopen failed
+  RDB_ERR_MAGIC,  // wrong RDBX header
+} RdbStatus;
+
+int ht_save(HashTable *ht, const char *filename);
+int ht_load(HashTable **ht, const char *filename);
+```
+
+`ht_save` returns `1` on success, `0` if the file could not be opened. `ht_load` returns one of the `RdbStatus` values.
+
+## File format
+
+Every snapshot starts with the 5-byte ASCII magic string `RDBX1`, followed by a 4-byte entry count, then a sequence of serialized key-value-expiry triples:
+
+```text
+[RDBX1]                     ← 5 bytes, ASCII magic
+[uint32_t count]            ← number of entries
+for each entry:
+  [uint32_t klen][key]      ← 4-byte length + raw key bytes
+  [uint32_t vlen][value]    ← 4-byte length + raw value bytes
+  [time_t expires_at]       ← expiry timestamp (0 = no expiry)
+```
+
+The magic string lets `ht_load` reject unrelated files immediately rather than attempting to deserialize garbage.
+
+## Saving a snapshot
+
+`ht_save` opens the file in binary write mode, writes the header, then walks every bucket chain:
+
+```c
+int ht_save(HashTable *ht, const char *filename) {
+  FILE *f = fopen(filename, "wb");
+  if (!f)
+    return 0;
+
+  fwrite("RDBX1", 1, 5, f);
+  uint32_t count = ht->count;
+  fwrite(&count, sizeof(uint32_t), 1, f);
+
+  for (size_t i = 0; i < ht->size; i++) {
+    Entry *entry = ht->buckets[i];
+    while (entry != NULL) {
+      uint32_t klen = strlen(entry->key);
+      fwrite(&klen, sizeof(uint32_t), 1, f);
+      fwrite(entry->key, 1, klen, f);
+
+      uint32_t vlen = strlen(entry->value);
+      fwrite(&vlen, sizeof(uint32_t), 1, f);
+      fwrite(entry->value, 1, vlen, f);
+
+      fwrite(&entry->expires_at, sizeof(time_t), 1, f);
+
+      entry = entry->next;
+    }
+  }
+  fclose(f);
+  return 1;
+}
+```
+
+Note that `ht_save` does **not** skip expired keys — it serializes whatever is in the hash table at call time, including entries that are past their `expires_at` timestamp but have not been lazily evicted yet. Those entries will be evicted on the next `ht_get` or `ht_ttl` call after the snapshot is loaded.
+
+## Loading a snapshot
+
+`ht_load` validates the magic string, frees any existing hash table, creates a fresh one, then reads exactly `count` entries:
+
+```c
+int ht_load(HashTable **ht, const char *filename) {
+  FILE *f = fopen(filename, "rb");
+  if (!f)
+    return RDB_ERR_OPEN;
+
+  char magic[6];
+  fread(magic, 1, 5, f);
+  magic[5] = '\0';
+
+  if (strcmp(magic, "RDBX1") != 0) {
+    fclose(f);
+    return RDB_ERR_MAGIC;
+  }
+
+  if (*ht) {
+    ht_free(*ht);
+  }
+  *ht = ht_create(8);
+  /* ... read count entries, call ht_set for each ... */
+  fclose(f);
+  return RDB_OK;
+}
+```
+
+The caller passes a pointer-to-pointer so `ht_load` can replace the existing hash table in place. The old table is freed before the new one is populated.
+
+## Error handling
+
+| Return value | Meaning |
+|---|---|
+| `RDB_OK` (1) | Snapshot loaded successfully |
+| `RDB_ERR_OPEN` | `fopen` failed — file missing or permission denied |
+| `RDB_ERR_MAGIC` | First 5 bytes are not `RDBX1` — wrong file or corrupted |
+
+## When to use snapshots
+
+- **Point-in-time backups** — copy the snapshot file while the server is running; the AOF continues independently.
+- **Migrating data** — load a snapshot on a new instance to seed its keyspace.
+- **Faster cold start** — loading a single snapshot is faster than replaying a long AOF, especially after a `REWRITE` has not been run in a while.
+
+<Warning>
+If the process crashes during `SAVE`, the snapshot file may be partially written. A partial snapshot has a valid `RDBX1` header but fewer entries than recorded in the count field. `ht_load` will read whatever entries are present before hitting EOF, leaving the hash table incomplete. Always verify a snapshot by checking the entry count, or keep the previous snapshot until the new one is confirmed complete.
+</Warning>

@@ -1,0 +1,151 @@
+---
+title: "AOF (Append-Only File) internals"
+description: "How RadishDB's write-ahead log ensures crash safety with length-prefixed records and fsync."
+---
+
+The Append-Only File (AOF) is RadishDB's write-ahead log. Every mutation — `SET` or `DEL` — is written to the AOF and fsynced **before** the response is returned to the client. If the process crashes, you can recover the full dataset by replaying the log.
+
+## Function reference
+
+```c
+/* Helpers */
+void trim_newline(char *s);
+int  split_tokens(char *line, char *argv[], int max);
+
+/* File lifecycle */
+int  aof_open(const char *filename);
+void aof_close(void);
+
+/* Write path */
+void aof_append_set(const char *key, const char *value, const char *expire_at);
+void aof_append_del(const char *key);
+
+/* Recovery */
+int  aof_replay(HashTable *h, const char *filename);
+
+/* Compaction */
+void aof_rewrite(HashTable *ht, const char *filename);
+```
+
+## Record format
+
+Each record is a **length-prefixed** text command:
+
+```text
+[uint32_t length][command text]
+```
+
+For example, `SET name radish` encodes as:
+
+```text
+[0x0F 0x00 0x00 0x00][SET name radish]
+```
+
+The 4-byte little-endian length field comes first. The reader uses it to know exactly how many bytes to read for the command body. If fewer bytes are available (partial write due to a crash), `aof_replay` discards the record and stops — the log is consistent up to the last complete record.
+
+A SET with expiry writes:
+
+```text
+SET <key> <value> EX <unix-timestamp>
+```
+
+## Opening and closing
+
+`aof_open` opens the file in **append + read** mode (`"ab+"`):
+
+```c
+int aof_open(const char *filename) {
+  aof_file = fopen(filename, "ab+");
+  if (!aof_file)
+    return 0;
+  return 1;
+}
+```
+
+The file handle is stored in a module-level static (`aof_file`). `aof_close` flushes and closes it:
+
+```c
+void aof_close(void) {
+  if (aof_file) {
+    fclose(aof_file);
+    aof_file = NULL;
+  }
+}
+```
+
+## Writing records
+
+Both `aof_append_set` and `aof_append_del` follow the same pattern: format the command string, write the 4-byte length, write the command bytes, then call `fflush` + `fsync`:
+
+```c
+void aof_append_set(const char *key, const char *value, const char *expire_at) {
+  char buffer[256];
+  if (expire_at == NULL) {
+    snprintf(buffer, sizeof(buffer), "SET %s %s", key, value);
+  } else {
+    snprintf(buffer, sizeof(buffer), "SET %s %s EX %s", key, value, expire_at);
+  }
+
+  uint32_t length = (uint32_t)strlen(buffer);
+  fwrite(&length, sizeof(uint32_t), 1, aof_file);
+  fwrite(buffer, length, 1, aof_file);
+
+  fflush(aof_file);
+  fsync(fileno(aof_file));
+}
+```
+
+`fsync` forces the OS to flush its page cache to physical storage. Without it, a power loss after `fwrite` but before the kernel writes to disk would silently lose the record.
+
+## Replaying the log
+
+On startup, `aof_replay` reads the file from the beginning and re-executes every record:
+
+```c
+int aof_replay(HashTable *ht, const char *filename);
+```
+
+The function first checks for the `AOFX1` magic header (written by `aof_rewrite` — see [AOF rewrite](/internals/log-compaction)). If the header is present it seeks past it; otherwise it reads from offset 0. It then loops:
+
+1. Read 4 bytes → `len`.
+2. Sanity-check: reject if `len == 0` or `len > 1 MB`.
+3. `malloc(len + 1)` and read exactly `len` bytes.
+4. If fewer than `len` bytes are available (truncated record), free and break.
+5. NUL-terminate, then call `split_tokens` to parse the command.
+6. Execute `ht_set` or `ht_delete` on the in-memory hash table.
+
+Step 4 is where partial-write protection activates: a crash mid-record leaves an incomplete payload, and the length check catches it.
+
+## Token splitting helpers
+
+`trim_newline` strips a trailing `\r` or `\n` from a string in place. `split_tokens` splits a mutable string on whitespace and fills a `char *argv[]` array:
+
+```c
+void trim_newline(char *s);
+int  split_tokens(char *line, char *argv[], int max);
+```
+
+These are used by `aof_replay` to parse each replayed command without pulling in a full command parser.
+
+## What happens on a SET command
+
+<Steps>
+  <Step title="Command received">
+    The server reads and parses a `SET key value` command from the client socket.
+  </Step>
+  <Step title="AOF append">
+    `aof_append_set(key, value, expire_at)` formats the record, writes the length prefix and command text to the AOF file, then calls `fflush` and `fsync`. The write is durable on disk before continuing.
+  </Step>
+  <Step title="Apply to hash table">
+    `ht_set(ht, key, value, expires_at)` inserts or updates the key in the in-memory hash table.
+  </Step>
+  <Step title="Return OK">
+    The server sends `+OK\r\n` back to the client.
+  </Step>
+</Steps>
+
+If the process crashes between step 2 and step 3, the AOF contains the record but the hash table never saw it. On the next startup, `aof_replay` re-applies the record, so no data is lost.
+
+## Crash safety and partial writes
+
+A crash during step 2 — after `fwrite(&length)` but before `fwrite(buffer)` completes — leaves a partial record in the file. When `aof_replay` reads the length field and then tries to read `len` bytes, `fread` returns fewer than `len`. The replay loop breaks at that point, discarding the incomplete record. All records before it are intact and already applied.

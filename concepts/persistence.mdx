@@ -1,0 +1,137 @@
+---
+title: "Persistence"
+description: "RadishDB's two-layer persistence model: append-only file (AOF) and binary snapshots (.rdbx)."
+---
+
+RadishDB persists data through two independent mechanisms. They serve different purposes and can be used together:
+
+- **AOF (append-only file)** — automatic, always-on write-ahead log that provides crash safety.
+- **Snapshot (.rdbx)** — full binary dump of the current state, triggered manually for backups or migration.
+
+<Tabs>
+  <Tab title="AOF — write-ahead log">
+
+## How AOF works
+
+Every `SET` and `DEL` command is written to the log file **before** the client receives a response. On startup, RadishDB replays the log to restore state.
+
+### File location
+
+```text
+/app/aof/radish.aof   # Docker (volume-mounted)
+aof/radish.aof        # native build
+```
+
+### Record format
+
+Each AOF record is length-prefixed:
+
+```text
+[uint32_t length][command string]
+```
+
+The 4-byte length prefix lets `aof_replay` detect partial writes: if it reads a length but cannot read that many bytes, it discards the incomplete record and stops. This prevents replaying a torn write after a crash.
+
+### Functions
+
+| Function | Description |
+|---|---|
+| `aof_open(filename)` | Open (or create) the AOF file in append mode. |
+| `aof_append_set(key, value, expire_at)` | Write a `SET` record and call `fsync`. |
+| `aof_append_del(key)` | Write a `DEL` record and call `fsync`. |
+| `aof_replay(ht, filename)` | Read and re-execute every record in the log. |
+| `aof_rewrite(ht, filename)` | Compact the log: write only the current live state, drop obsolete history. |
+
+### Durability guarantee
+
+`aof_append_set` and `aof_append_del` both call `fsync` after every write:
+
+```c
+fwrite(&length, sizeof(uint32_t), 1, aof_file);
+fwrite(buffer, length, 1, aof_file);
+fflush(aof_file);
+fsync(fileno(aof_file));
+```
+
+This guarantees that a committed write reaches disk even if the process crashes immediately after returning `OK` to the client.
+
+### Log compaction (AOF rewrite)
+
+Over time the AOF grows as the same keys are overwritten. At startup, `main.c` checks whether the log has grown beyond 2× its base size and rewrites it:
+
+```c
+if (aof_size > aof_base_size * 2 || aof_base_size == 0) {
+    aof_rewrite(ht, "aof/radish.aof");
+}
+```
+
+`aof_rewrite` writes only the current live keys into a temporary file (`radish.aof.tmp`), flushes and syncs it, then atomically renames it over the old log. This keeps startup time bounded regardless of how long the database has been running.
+
+  </Tab>
+  <Tab title="Snapshot — .rdbx">
+
+## How snapshots work
+
+A snapshot is a full binary serialisation of the hash table at a point in time. You trigger it manually:
+
+```text
+SAVE mybackup
+```
+
+RadishDB appends `.rdbx` if the filename does not already include it. Load a snapshot with:
+
+```text
+LOAD mybackup.rdbx
+```
+
+Loading replaces the entire in-memory state.
+
+### File format
+
+```text
+[5 bytes magic: "RDBX1"]
+[uint32_t entry count]
+for each entry:
+  [uint32_t key_len][key bytes]
+  [uint32_t val_len][value bytes]
+  [time_t expires_at]
+```
+
+The `RDBX1` magic header lets `ht_load` reject files that are not valid snapshots.
+
+### Functions
+
+| Function | Description |
+|---|---|
+| `ht_save(ht, filename)` | Serialise the current hash table to a `.rdbx` file. |
+| `ht_load(&ht, filename)` | Free the current table, allocate a new one, and deserialise from file. |
+
+### RdbStatus
+
+`ht_load` returns one of:
+
+```c
+typedef enum {
+  RDB_OK,        // load succeeded
+  RDB_ERR_OPEN,  // fopen failed
+  RDB_ERR_MAGIC, // wrong RDBX header
+} RdbStatus;
+```
+
+  </Tab>
+</Tabs>
+
+## When to use each
+
+| | AOF | Snapshot |
+|---|---|---|
+| **Trigger** | Automatic on every write | Manual: `SAVE` / `LOAD` |
+| **Purpose** | Crash safety, recovery | Explicit backup or migration |
+| **Overhead** | `fsync` per write | Full scan on demand |
+| **Startup** | Replayed automatically | Must be explicitly `LOAD`ed |
+| **Compaction** | `aof_rewrite` on startup | Not applicable |
+
+<Tip>
+  Use the AOF for day-to-day durability and crash recovery. Use snapshots when
+  you want a portable backup you can copy, version, or load into another instance.
+</Tip>

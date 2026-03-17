@@ -1,0 +1,40 @@
+---
+title: "DEL"
+description: "Delete a key and its associated value from the database."
+---
+
+## Syntax
+
+```text
+DEL key
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The key to delete.
+</ParamField>
+
+## Returns
+
+- `1` if the key existed and was successfully deleted.
+- `0` (returned as `(nil)`) if the key did not exist.
+
+## Behavior
+
+- The key and its associated value are freed from memory immediately.
+- If the deletion succeeds (key existed), a `DEL` record is appended to the append-only file (AOF) before the result is returned.
+- Deleting a key that does not exist is a no-op and does not produce an error.
+
+## Examples
+
+```text
+SET name radish
+OK
+
+DEL name
+1
+
+DEL name
+0
+```

@@ -1,0 +1,117 @@
+---
+title: "Storage engine"
+description: "How RadishDB stores data in memory using a hash table with separate chaining."
+---
+
+All key-value data lives in a single `HashTable` allocated on the heap at startup. The implementation is in `hashtable.c` and uses **separate chaining** — each bucket holds the head of a singly-linked list of `Entry` nodes.
+
+## Data structures
+
+### Entry
+
+Each key-value pair is stored as an `Entry` node:
+
+```c
+typedef struct Entry {
+  char          *key;        // heap-allocated, strdup'd on insert
+  char          *value;      // heap-allocated, strdup'd on insert
+  time_t         expires_at; // Unix timestamp; 0 means no expiry
+  struct Entry  *next;       // next node in this bucket's chain
+} Entry;
+```
+
+### HashTable
+
+```c
+typedef struct HashTable {
+  Entry  **buckets;  // array of Entry* heads, one per bucket
+  size_t   size;     // current number of buckets
+  int      count;    // number of live keys
+  int      resizes;  // how many times the table has been resized
+} HashTable;
+```
+
+<Note>
+  Because RadishDB is single-threaded, no locks protect the hash table. All
+  reads and writes are serialised through `execute_command()`, so there is no
+  risk of concurrent modification.
+</Note>
+
+## Hash function
+
+RadishDB uses a djb2-style hash:
+
+```c
+unsigned long hash(const char *str) {
+  unsigned long hash = 5381;
+  for (int i = 0; str[i] != '\0'; i++) {
+    hash = hash * 33 + str[i];
+  }
+  return hash;
+}
+```
+
+The bucket index is `hash(key) % ht->size`.
+
+## Operations
+
+| Function | Signature | Description |
+|---|---|---|
+| `ht_create` | `HashTable *ht_create(int size)` | Allocate a new hash table with `size` buckets. |
+| `ht_set` | `void ht_set(HashTable *ht, const char *key, const char *value, time_t expires_at)` | Insert or update a key. Triggers resize when load factor exceeds 0.75. |
+| `ht_get` | `char *ht_get(HashTable *ht, const char *key)` | Return the value string, or `NULL` if missing or expired. |
+| `ht_delete` | `int ht_delete(HashTable *ht, const char *key)` | Remove a key. Returns `1` on success, `0` if not found. |
+| `ht_ttl` | `long ht_ttl(HashTable *ht, const char *key)` | Return seconds remaining, `-1` if no TTL, `-2` if missing/expired. |
+| `ht_info` | `Info ht_info(HashTable *ht)` | Return internal statistics. |
+| `ht_resize` | `void ht_resize(HashTable *ht, int new_size)` | Rehash all entries into a new bucket array. |
+| `ht_free` | `void ht_free(HashTable *ht)` | Free all entries and the table itself. |
+
+## Automatic resizing
+
+`ht_set` checks the load factor before every insert:
+
+```c
+float load = (float)ht->count / ht->size;
+if (load > 0.75f) {
+    ht_resize(ht, ht->size * 2);
+}
+```
+
+When the load factor exceeds 0.75, the bucket array doubles in size and all existing entries are rehashed into the new array. The `resizes` counter on the `HashTable` struct tracks how many times this has occurred.
+
+## Memory ownership
+
+Both the key and value strings are heap-allocated copies (`strdup`) when an entry is created or updated:
+
+```c
+new_entry->key   = strdup(key);
+new_entry->value = strdup(value);
+```
+
+When an entry is deleted (either via `DEL` or passive expiry), both strings and the `Entry` node itself are freed:
+
+```c
+free(entry->value);
+free(entry->key);
+free(entry);
+```
+
+The caller never needs to manage the lifetime of returned value pointers — they are valid only until the next mutation on the same key.
+
+## INFO statistics
+
+The `Info` struct returned by `ht_info()` gives you a snapshot of the table's internal state:
+
+```c
+typedef struct Info {
+  int   keys;          // number of live keys
+  int   keys_with_ttl; // keys that have an expiry set
+  int   expired_keys;  // keys past their expiry (not yet swept)
+  int   buckets;       // current bucket count
+  float load_factor;   // keys / buckets
+  int   max_chain;     // longest collision chain
+  int   resizes;       // total resize operations
+} Info;
+```
+
+Run `INFO` from any frontend to see these values at runtime.

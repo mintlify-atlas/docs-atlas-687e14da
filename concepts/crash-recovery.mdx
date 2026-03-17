@@ -1,0 +1,101 @@
+---
+title: "Crash recovery"
+description: "How RadishDB restores database state after a crash using AOF replay."
+---
+
+RadishDB uses its append-only file (AOF) as a write-ahead log. Every committed write is flushed to disk before the client receives a response, so when the process restarts after a crash, it can replay the log and recover the exact state that existed at the time of the crash.
+
+## Recovery flow
+
+<Steps>
+  <Step title="Process crashes">
+    The RadishDB process terminates unexpectedly. The in-memory hash table is
+    lost. The AOF file on disk contains every `SET` and `DEL` that was committed
+    before the crash — each flushed by `fsync` before returning `OK`.
+  </Step>
+  <Step title="Process restarts">
+    `main.c` starts up and immediately calls:
+
+    ```c
+    aof_open("aof/radish.aof");
+    aof_replay(ht, "aof/radish.aof");
+    ```
+  </Step>
+  <Step title="aof_replay reads the log">
+    `aof_replay` opens the file and reads length-prefixed records one at a time:
+
+    ```c
+    uint32_t len;
+    fread(&len, sizeof(uint32_t), 1, f);  // read record length
+    char *cmd = malloc(len + 1);
+    fread(cmd, 1, len, f);                // read command string
+    ```
+
+    If `fread` returns fewer bytes than `len`, the record is incomplete — a
+    partial write caused by the crash. The incomplete record is discarded and
+    replay stops. No corrupt state is applied.
+  </Step>
+  <Step title="Commands are re-executed">
+    Each complete record is tokenised and applied directly to the hash table:
+
+    ```c
+    if (strcmp(argv[0], "SET") == 0 && argc >= 3) {
+        // re-apply SET with original expires_at
+        ht_set(ht, argv[1], argv[2], expires);
+    } else if (strcmp(argv[0], "DEL") == 0 && argc == 2) {
+        ht_delete(ht, argv[1]);
+    }
+    ```
+
+    Only `SET` and `DEL` entries are present in the log — reads are never
+    written to the AOF.
+  </Step>
+  <Step title="Expiry cursor is re-initialised">
+    After replay, `main.c` calls `expire_init(ht)` to reset the active sweeper
+    cursor. The sweeper can then begin cleaning up any keys that expired while
+    the process was down.
+  </Step>
+  <Step title="AOF is compacted if needed">
+    If the log has grown beyond 2× its base size, `main.c` rewrites it:
+
+    ```c
+    if (aof_size > aof_base_size * 2 || aof_base_size == 0) {
+        aof_rewrite(ht, "aof/radish.aof");
+    }
+    ```
+
+    `aof_rewrite` serialises only the current live state into a new compact log,
+    removing all obsolete history. This keeps subsequent startup times fast.
+  </Step>
+</Steps>
+
+## Why recovery is deterministic
+
+The AOF records commands, not data pages. Because `SET` and `DEL` are pure functions of the hash table state, replaying the same sequence of commands always produces the same state. There is no randomness or timestamp dependency in the command semantics themselves (TTL expirations are recalculated relative to the current wall clock — see the warning below).
+
+## Durability guarantee
+
+Every write path calls `fsync` before returning to the caller:
+
+```c
+fwrite(&length, sizeof(uint32_t), 1, aof_file);
+fwrite(buffer,  length,           1, aof_file);
+fflush(aof_file);
+fsync(fileno(aof_file));  // blocks until OS confirms disk write
+```
+
+This means the only writes that can be lost in a crash are writes that had not yet been acknowledged to the client — which by definition were never committed.
+
+## A bug that taught the author
+
+An early version of RadishDB did not write `DEL` entries to the AOF. After a crash, replaying the log would re-insert keys that the operator had explicitly deleted — the recovered state diverged from the pre-crash state. Adding `aof_append_del` to the `DEL` handler fixed this. The lesson: every mutation that changes observable state must be logged, not just writes.
+
+<Warning>
+  TTL expiry and AOF replay interact in a subtle way. When a key with `EX` is
+  replayed, RadishDB recalculates `expires_at` as `time(NULL) + ttl_seconds`.
+  A key that was set with `EX 60` ten seconds before a crash will be replayed
+  with a fresh 60-second TTL rather than the 50 seconds it had left. The key
+  will exist in the recovered state but will expire on its first access once
+  the original deadline passes. This is a known limitation of the current
+  implementation.
+</Warning>

@@ -1,0 +1,144 @@
+---
+title: "AOF file format"
+description: "The append-only file (AOF) format used by RadishDB for write-ahead logging and crash recovery."
+---
+
+The append-only file (AOF) is RadishDB's write-ahead log (WAL). Every mutation (`SET`, `DEL`) is serialised and flushed to disk with `fflush` + `fsync` **before** the command is considered complete. On restart the log is replayed in order to rebuild the in-memory state.
+
+## File location
+
+| Environment | Path |
+|---|---|
+| Native (default) | `aof/radish.aof` (relative to working directory) |
+| Docker | `/app/aof/radish.aof` |
+
+## File structure
+
+A freshly compacted AOF (after `aof_rewrite`) starts with a fixed header. A brand-new file that has never been rewritten contains only records with no header.
+
+```text
+[optional header]
+[record] [record] [record] ...
+```
+
+### Header (present after rewrite)
+
+Written by `aof_rewrite` when the log is compacted.
+
+```c
+#define AOF_MAGIC     "AOFX1"
+#define AOF_MAGIC_LEN 5
+```
+
+| Offset | Size | Description |
+|---|---|---|
+| 0 | 5 bytes | Magic string `AOFX1` (ASCII, no null terminator) |
+| 5 | 8 bytes | `uint64_t` base file size (little-endian on x86) |
+
+During replay, `aof_replay` reads the first 5 bytes and checks them against `"AOFX1"`. If they match, it also reads the 8-byte base size and then continues to the record stream. If the magic is absent the file pointer is rewound to offset 0 and record parsing begins from the start.
+
+### Records
+
+Every record (SET or DEL) is stored as a **length-prefixed text entry**:
+
+| Field | Size | Description |
+|---|---|---|
+| `length` | 4 bytes (`uint32_t`, little-endian on x86) | Byte count of the command string that follows |
+| `command` | `length` bytes | Plain-text command, **not** null-terminated in the file |
+
+```c
+uint32_t length = (uint32_t)strlen(buffer);
+fwrite(&length, sizeof(uint32_t), 1, aof_file);
+fwrite(buffer, length, 1, aof_file);
+fflush(aof_file);
+fsync(fileno(aof_file));
+```
+
+## Record types
+
+### SET record
+
+```text
+SET <key> <value>
+```
+
+With expiry:
+
+```text
+SET <key> <value> EX <expires_at>
+```
+
+<Note>
+The expiry field written to the AOF is an **absolute Unix timestamp** (seconds since the epoch), not a relative TTL in seconds. When the log is replayed the value is used directly as the expiration time for the key. This means that a key with a short TTL that was written to the AOF a long time ago will appear expired immediately on replay.
+</Note>
+
+### DEL record
+
+```text
+DEL <key>
+```
+
+## Example: hex + text representation
+
+A single `SET name radish` entry looks like this on disk:
+
+```text
+Bytes: 0E 00 00 00  53 45 54 20 6E 61 6D 65 20 72 61 64 69 73 68
+       ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+       length = 14  "SET name radish"
+```
+
+A `SET color red EX 1744000000` entry (14 characters in the command string: count varies):
+
+```text
+[4-byte uint32 length]["SET color red EX 1744000000"]
+```
+
+## Replay process
+
+On startup `aof_replay` rebuilds the hash table by iterating every record:
+
+1. Read 4-byte `length`.
+2. Sanity-check: reject if `length == 0` or `length > 1 MiB`.
+3. Read exactly `length` bytes into a heap buffer.
+4. Null-terminate and tokenise with `split_tokens`.
+5. Apply the command (`ht_set` or `ht_delete`) to the live hash table.
+6. Repeat until `fread` returns fewer than 1 record (EOF or short read).
+
+### Partial write protection
+
+If a crash truncates the last record mid-write, step 3 will read fewer bytes than `length` specifies (`got != len`). The replay loop immediately breaks out, discarding the incomplete record. No corrupt data is applied.
+
+```c
+size_t got = fread(cmd, 1, len, f);
+if (got != len) {
+    free(cmd);
+    break;   // truncated record — stop replay here
+}
+```
+
+## AOF rewrite (log compaction)
+
+`aof_rewrite` compacts the log to only the current live state, removing superseded and deleted entries:
+
+1. Opens a temporary file `aof/radish.aof.tmp`.
+2. Writes the `AOFX1` header with a placeholder base size.
+3. Iterates the hash table; skips keys that have already expired.
+4. Writes one `SET` record per live key (with `EX <ttl>` if the key has an expiry).
+5. `fflush` + `fsync`.
+6. Seeks back to offset 5 and writes the final file size into the `uint64_t` base size field.
+7. `fflush` + `fsync` again.
+8. Atomically renames the temp file over the original via `rename(2)`.
+9. Reopens the live append handle in `"ab"` mode.
+
+At startup RadishDB automatically triggers a rewrite if the current file size is more than twice the compacted base size, or if no base size has been recorded yet:
+
+```c
+if (aof_size > aof_base_size * 2 || aof_base_size == 0) {
+    aof_rewrite(ht, "aof/radish.aof");
+}
+```
+
+<Warning>
+Manually editing the AOF file can corrupt the database. The 4-byte length prefix must exactly match the byte length of the command string that follows. A mismatch will cause subsequent records to be misaligned and silently dropped during replay, resulting in data loss.
+</Warning>

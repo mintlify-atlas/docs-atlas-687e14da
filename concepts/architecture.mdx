@@ -1,0 +1,111 @@
+---
+title: "Architecture"
+description: "How RadishDB separates the storage engine, persistence layers, and protocol frontends."
+---
+
+RadishDB is built around a **protocol-agnostic engine**: the core execution logic in `engine.c` has no knowledge of I/O. It parses commands, applies them to the hash table, and returns a `Result` value. Frontends consume that result and decide how to present it — over stdin/stdout or over TCP.
+
+This separation means you can add new frontends (HTTP, Unix socket, gRPC) without touching the storage layer, and you can test the storage layer in isolation without a network stack.
+
+## Module map
+
+```text
+engine.c      → command semantics, returns Result
+hashtable.c   → in-memory storage engine
+aof.c         → append-only file (write-ahead log)
+expires.c     → TTL tracking and active sweeper
+persistence.c → binary snapshot (.rdbx)
+repl.c        → interactive REPL frontend
+server.c      → TCP server frontend
+result.c      → Result type helpers
+main.c        → startup, lifecycle, flag parsing
+```
+
+## Protocol-agnostic engine
+
+`engine.c` exposes a single entry point:
+
+```c
+Result execute_command(HashTable *ht, char *line);
+```
+
+It tokenises the input line, dispatches to the appropriate handler (SET, GET, DEL, TTL, SAVE, LOAD, …), and returns a `Result`. It never calls `printf`, `write`, or any socket function.
+
+### Result type
+
+Every command returns a `Result` tagged with one of these variants:
+
+```c
+typedef enum {
+  RES_STRING,   // bulk string response
+  RES_OK,       // simple OK
+  RES_ERROR,    // error message
+  RES_INTEGER,  // integer value
+  RES_NIL,      // null / not found
+  RES_CLEAN,    // clear screen (REPL only)
+  RES_EXIT      // terminate the session
+} ResultType;
+
+typedef struct Result {
+  ResultType type;
+  union {
+    char *string; // for RES_STRING and RES_ERROR
+    long  integer; // for RES_INTEGER
+  } value;
+} Result;
+```
+
+Frontends switch on `result.type` to format the output appropriately.
+
+## Frontends
+
+<CardGroup cols={2}>
+  <Card title="REPL (repl.c)" icon="terminal">
+    Reads from `stdin`, writes to `stdout`. Calls `execute_command()` in a loop.
+    Handles `RES_CLEAN` to clear the terminal. Used in interactive and testing
+    scenarios.
+  </Card>
+  <Card title="TCP server (server.c)" icon="server">
+    Accepts connections on port 6379. Reads commands from the socket, calls
+    `execute_command()`, and writes the result back. Each client gets the same
+    engine, same hash table.
+  </Card>
+</CardGroup>
+
+Both frontends call the identical `execute_command()` function — there is no duplicated command logic.
+
+## Persistence layers
+
+<CardGroup cols={2}>
+  <Card title="AOF — append-only file (aof.c)" icon="file-pen">
+    Every SET and DEL is written to `radish.aof` before the client receives a
+    response. On startup, `aof_replay()` re-executes each entry to rebuild state.
+    Provides crash safety.
+  </Card>
+  <Card title="Snapshot — .rdbx (persistence.c)" icon="floppy-disk">
+    `ht_save()` serialises the full hash table to a binary file with an `RDBX1`
+    magic header. `ht_load()` replaces the current in-memory state. Triggered
+    manually with `SAVE` / `LOAD`.
+  </Card>
+</CardGroup>
+
+## Single-threaded design
+
+<Note>
+  RadishDB is intentionally single-threaded. There are no mutexes, no read-write
+  locks, and no concurrent access to the hash table. This eliminates an entire
+  class of bugs and was a deliberate design tradeoff — the same choice Redis
+  made in its early versions.
+</Note>
+
+## Startup sequence
+
+`main.c` wires everything together at startup:
+
+1. Create the hash table with `ht_create(8)`.
+2. Open the AOF file with `aof_open()`.
+3. Replay existing log entries with `aof_replay()`.
+4. Re-initialise the expiry cursor with `expire_init()`.
+5. Rewrite the AOF if it has grown beyond 2× its base size.
+6. Launch either the REPL (`repl_loop()`) or the TCP server (`start_server()`)
+   depending on the `--server` flag.

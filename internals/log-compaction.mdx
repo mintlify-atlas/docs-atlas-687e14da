@@ -1,0 +1,125 @@
+---
+title: "AOF rewrite and log compaction"
+description: "How RadishDB compacts the AOF log to bound disk usage and speed up startup."
+---
+
+The AOF log grows forever as long as keys are written and deleted. A key overwritten 1,000 times leaves 1,000 records in the log, but only the most recent one matters. Log compaction — called **AOF rewrite** in RadishDB — replaces the full history with a compact file that contains only the current live state.
+
+## The problem
+
+Consider this sequence:
+
+```bash
+SET counter 1
+SET counter 2
+SET counter 3
+# ... 997 more updates ...
+DEL counter
+```
+
+The AOF holds 1,001 records. On the next startup, `aof_replay` replays all 1,001 records to arrive at an empty `counter` key. The rewrite collapses this to zero records — `counter` is dead, so it is omitted entirely.
+
+## The rewrite function
+
+```c
+void aof_rewrite(HashTable *ht, const char *filename);
+```
+
+`aof_rewrite` serializes every **live, non-expired** key in the current hash table as a new compact AOF, then atomically replaces the old log file:
+
+```c
+void aof_rewrite(HashTable *ht, const char *filename) {
+  FILE *tmp = fopen("aof/radish.aof.tmp", "wb");
+  if (!tmp)
+    return;
+
+  // Write AOFX1 header
+  fwrite(AOF_MAGIC, 1, AOF_MAGIC_LEN, tmp);
+  uint64_t base_size = 0;
+  fwrite(&base_size, sizeof(uint64_t), 1, tmp);
+
+  time_t now = time(NULL);
+
+  for (size_t i = 0; i < ht->size; i++) {
+    Entry *e = ht->buckets[i];
+    while (e) {
+      // Skip keys that are already expired
+      if (e->expires_at && e->expires_at <= now) {
+        e = e->next;
+        continue;
+      }
+      char cmd[256];
+      if (e->expires_at) {
+        int ttl = (int)(e->expires_at - now);
+        snprintf(cmd, sizeof(cmd), "SET %s %s EX %d", e->key, e->value, ttl);
+      } else {
+        snprintf(cmd, sizeof(cmd), "SET %s %s", e->key, e->value);
+      }
+      uint32_t len = strlen(cmd);
+      fwrite(&len, sizeof(uint32_t), 1, tmp);
+      fwrite(cmd, 1, len, tmp);
+      e = e->next;
+    }
+  }
+
+  fflush(tmp);
+  fsync(fileno(tmp));
+
+  // Patch the base_size field with the final file size
+  uint64_t final_size = ftell(tmp);
+  fseek(tmp, 5, SEEK_SET);
+  fwrite(&final_size, sizeof(uint64_t), 1, tmp);
+  fflush(tmp);
+  fsync(fileno(tmp));
+
+  fclose(tmp);
+
+  // Atomic rename over the live AOF
+  rename("aof/radish.aof.tmp", filename);
+
+  fclose(aof_file);
+  aof_file = fopen(filename, "ab");
+}
+```
+
+## Rewrite flow
+
+<Steps>
+  <Step title="Open a temporary file">
+    `aof_rewrite` creates `aof/radish.aof.tmp` in binary write mode. All new records go here — the live AOF is untouched at this point.
+  </Step>
+  <Step title="Write the AOFX1 header">
+    The 5-byte magic `AOFX1` and a placeholder 8-byte `base_size` field are written at offset 0. The final file size is patched in after all records are written.
+  </Step>
+  <Step title="Serialize live keys">
+    Every bucket chain in the hash table is walked. Expired keys (`expires_at > 0 && expires_at <= now`) are skipped. Each live key is formatted as `SET key value [EX ttl]` with its remaining TTL in seconds, length-prefixed, and written to the temp file.
+  </Step>
+  <Step title="Fsync the temp file">
+    `fflush` + `fsync` ensures the compact log hits disk before the rename. This guarantees the new file is complete if the process crashes during the next step.
+  </Step>
+  <Step title="Atomic rename">
+    `rename("aof/radish.aof.tmp", filename)` atomically replaces the old AOF on POSIX systems. If the process crashes here, one of the two complete files is in place — recovery is always possible.
+  </Step>
+  <Step title="Reopen for appending">
+    The old `aof_file` handle is closed. The new compact file is reopened in append mode (`"ab"`). Subsequent `SET` and `DEL` commands append to the compacted log.
+  </Step>
+</Steps>
+
+## Crash safety
+
+If the process crashes **before** the `rename`, the temp file is left on disk but the original AOF is intact. On the next startup, `aof_replay` reads the original unmodified log and recovers the full state. The orphaned temp file can be deleted safely.
+
+If the process crashes **after** the `rename` but before the handle is reopened, the compacted AOF is on disk and complete. `aof_replay` reads it normally on the next startup.
+
+## Comparison with Redis BGREWRITEAOF
+
+| | RadishDB | Redis |
+|---|---|---|
+| Execution | Synchronous, blocks all commands | Background via `fork()` |
+| Concurrency | None — single-threaded | Child writes new AOF; parent buffers new commands |
+| Trigger | Manual `REWRITE` command | Manual or automatic (size threshold) |
+| Risk during rewrite | Server is unresponsive | Minimal — fork isolates the rewrite |
+
+<Note>
+Because RadishDB is single-threaded, `aof_rewrite` blocks the event loop for the full duration of the rewrite. For large datasets this can cause a noticeable pause. There is no background rewrite mechanism. Plan rewrites during low-traffic windows.
+</Note>

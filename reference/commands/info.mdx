@@ -1,0 +1,70 @@
+---
+title: "INFO"
+description: "Display diagnostic information about the database state and storage engine."
+---
+
+## Syntax
+
+```text
+INFO
+```
+
+## Parameters
+
+None.
+
+## Returns
+
+A multi-line string containing internal database metrics. The fields reported are:
+
+<ResponseField name="Version" type="string">
+  RadishDB version number.
+</ResponseField>
+
+<ResponseField name="Uptime Seconds" type="integer">
+  Seconds elapsed since the engine was started.
+</ResponseField>
+
+<ResponseField name="Keys" type="integer">
+  Total number of keys currently stored in the hash table (including expired but unswept keys).
+</ResponseField>
+
+<ResponseField name="Keys with TTL" type="integer">
+  Number of keys that have an expiration timestamp set.
+</ResponseField>
+
+<ResponseField name="Expired keys" type="integer">
+  Number of keys whose TTL has elapsed but have not yet been removed by the sweeper or passive expiration.
+</ResponseField>
+
+<ResponseField name="Buckets" type="integer">
+  Current number of buckets in the hash table. The table starts at the initial size and doubles when the load factor exceeds 0.75.
+</ResponseField>
+
+<ResponseField name="Load Factor" type="float">
+  Ratio of stored keys to total buckets (`keys / buckets`). A value above 0.75 triggers a resize.
+</ResponseField>
+
+<ResponseField name="Max chain" type="integer">
+  Length of the longest collision chain across all buckets. Useful for detecting hash distribution problems.
+</ResponseField>
+
+<ResponseField name="Resizes" type="integer">
+  Number of times the hash table has been resized since startup.
+</ResponseField>
+
+## Example output
+
+```text
+Version : 0.1
+Uptime Seconds :42
+
+Keys : 5
+Keys with TTL : 2
+Expired keys : 1
+
+Buckets : 16
+Load Factor : 0.312500
+Resizes : 0
+Max chain : 1
+```

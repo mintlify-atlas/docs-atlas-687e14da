@@ -1,0 +1,112 @@
+---
+title: "RDBX snapshot format"
+description: "Binary snapshot file format (.rdbx) for full-state save and restore."
+---
+
+An RDBX file is a binary snapshot of the entire RadishDB state at a single point in time. Unlike the AOF log, it is not a replay log — it is a complete, self-contained dump that can be loaded to instantly restore the database.
+
+Snapshots are written with the `SAVE` command and loaded with the `LOAD` command.
+
+## File extension
+
+`.rdbx`
+
+## Format structure
+
+```text
+[magic header] [entry count] [record] [record] ...
+```
+
+### Magic header
+
+| Offset | Size | Value | Description |
+|---|---|---|---|
+| 0 | 5 bytes | `RDBX1` | ASCII magic string, no null terminator |
+
+On load, the first 5 bytes are read into a 6-byte buffer (null-terminated for `strcmp`). If they do not equal `"RDBX1"` the file is rejected and `RDB_ERR_MAGIC` is returned.
+
+```c
+fwrite("RDBX1", 1, 5, f);         // save
+
+fread(magic, 1, 5, f);             // load
+magic[5] = '\0';
+if (strcmp(magic, "RDBX1") != 0)   // validation
+    return RDB_ERR_MAGIC;
+```
+
+### Entry count
+
+| Offset | Size | Type | Description |
+|---|---|---|---|
+| 5 | 4 bytes | `uint32_t` | Number of key-value records that follow |
+
+### Key-value-expiry records
+
+Immediately after the entry count, the file contains exactly `count` records. Each record has the following layout (no padding, no separators):
+
+| Field | Size | Type | Description |
+|---|---|---|---|
+| `klen` | 4 bytes | `uint32_t` | Byte length of the key string |
+| `key` | `klen` bytes | `char[]` | Key bytes, not null-terminated |
+| `vlen` | 4 bytes | `uint32_t` | Byte length of the value string |
+| `value` | `vlen` bytes | `char[]` | Value bytes, not null-terminated |
+| `expires_at` | `sizeof(time_t)` bytes | `time_t` | Absolute Unix expiry timestamp; `0` means no expiry |
+
+```c
+uint32_t klen = strlen(entry->key);
+fwrite(&klen,           sizeof(uint32_t), 1, f);
+fwrite(entry->key,      1, klen,          f);
+
+uint32_t vlen = strlen(entry->value);
+fwrite(&vlen,           sizeof(uint32_t), 1, f);
+fwrite(entry->value,    1, vlen,          f);
+
+fwrite(&entry->expires_at, sizeof(time_t), 1, f);
+```
+
+<Note>
+`time_t` is 8 bytes on 64-bit Linux (the supported platform). The field stores an **absolute Unix timestamp** in seconds, not a relative TTL. A value of `0` indicates the key has no expiry.
+</Note>
+
+## Full file layout
+
+```text
+Offset  Size            Field
+------  ----            -----
+0       5 B             Magic: "RDBX1"
+5       4 B (uint32)    Entry count N
+9       ...             Record 0
+          4 B           klen
+          klen B        key
+          4 B           vlen
+          vlen B        value
+          8 B (time_t)  expires_at
+...     ...             Record 1 … N-1
+```
+
+## Return codes
+
+Defined in `persistence.h`:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `RDB_OK` | `1` | Snapshot loaded successfully |
+| `RDB_ERR_OPEN` | `2` | `fopen` failed (file not found or permission denied) |
+| `RDB_ERR_MAGIC` | `3` | First 5 bytes do not match `RDBX1` |
+
+## Usage
+
+```text
+SAVE backup.rdbx    # Write snapshot of current state
+LOAD backup.rdbx    # Replace in-memory state from snapshot
+```
+
+`LOAD` frees the existing hash table before populating from the snapshot. If `LOAD` fails (wrong magic, missing file) the in-memory state is freed and replaced with an empty hash table.
+
+<Note>
+AOF and RDBX snapshots are independent persistence mechanisms. The AOF log continues to grow (and replay) regardless of whether snapshots exist, and vice versa. A `SAVE` does not reset or truncate the AOF.
+</Note>
+
+<Warning>
+RDBX is not written atomically. If the process crashes mid-`SAVE`, the partially written file will have an incorrect entry count or truncated records. Do not use a snapshot file that was being written at the time of a crash — its magic header may be valid but its contents will be incomplete. Verify snapshots with a test `LOAD` before relying on them for recovery.
+</Warning>

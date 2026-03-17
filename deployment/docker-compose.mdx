@@ -1,0 +1,97 @@
+---
+title: "Docker Compose deployment"
+description: "Orchestrate RadishDB with Docker Compose for repeatable deployments."
+---
+
+Docker Compose gives you a declarative, version-controlled way to run RadishDB. A single `docker-compose.yml` file captures the full configuration, making deployments reproducible across machines.
+
+## The compose file
+
+The `docker-compose.yml` at the root of the repository defines the RadishDB service:
+
+```yaml
+version: "3.8"
+
+services:
+  radishdb:
+    build: .
+    container_name: radishdb
+    ports:
+      - "6379:6379"
+    volumes:
+      - radish-data:/app/aof
+    restart: unless-stopped
+
+volumes:
+  radish-data:
+```
+
+**Key configuration points:**
+
+- **`build: .`** — Compose builds the image locally from the `Dockerfile` in the current directory rather than pulling a pre-built image.
+- **`container_name: radishdb`** — Gives the container a fixed, predictable name.
+- **`ports: "6379:6379"`** — Exposes RadishDB on port 6379 of the host.
+- **`volumes: radish-data:/app/aof`** — Mounts the named volume `radish-data` at `/app/aof`, where the AOF persistence file lives.
+- **`restart: unless-stopped`** — Docker automatically restarts the container if it crashes or if the Docker daemon restarts, but not if you explicitly stop it with `docker-compose down`.
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/pie-314/RadishDB.git && cd RadishDB
+    ```
+  </Step>
+
+  <Step title="Start the service">
+    Build the image and start the container in the background:
+
+    ```bash
+    docker-compose up -d
+    ```
+
+    Compose builds the image on the first run. Subsequent starts reuse the cached image.
+  </Step>
+
+  <Step title="Verify and monitor">
+    Check that the container is running:
+
+    ```bash
+    docker-compose ps
+    ```
+
+    Tail the logs to confirm RadishDB started correctly:
+
+    ```bash
+    docker-compose logs
+    ```
+  </Step>
+
+  <Step title="Stop the service">
+    Stop and remove the container (the named volume is preserved):
+
+    ```bash
+    docker-compose down
+    ```
+  </Step>
+</Steps>
+
+## Common commands
+
+<CodeGroup>
+
+```bash Start
+docker-compose up -d
+```
+
+```bash Stop
+docker-compose down
+```
+
+```bash Logs
+docker-compose logs
+```
+
+```bash Status
+docker-compose ps
+```
+
+</CodeGroup>

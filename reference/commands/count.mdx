@@ -1,0 +1,49 @@
+---
+title: "COUNT"
+description: "Return the number of live keys currently stored in the database."
+---
+
+## Syntax
+
+```text
+COUNT
+```
+
+## Parameters
+
+None.
+
+## Returns
+
+An integer representing the number of keys currently tracked in the hash table.
+
+## Behavior
+
+- The count is read directly from the hash table's internal `count` field, which is incremented on every `SET` of a new key and decremented on every `DEL` or passive expiration.
+- Only the `COUNT` command itself is accepted; passing additional arguments returns an error.
+
+<Note>
+  RadishDB uses passive expiration: expired keys are removed only when they are accessed (via `GET`, `TTL`, etc.). Until a key is accessed or the active sweeper runs, it remains in the hash table and is included in the count. This means `COUNT` may briefly over-report the number of usable keys if expired keys have not yet been swept.
+</Note>
+
+## Examples
+
+```text
+SET a 1
+OK
+
+SET b 2
+OK
+
+SET c 3
+OK
+
+COUNT
+3
+
+DEL a
+1
+
+COUNT
+2
+```

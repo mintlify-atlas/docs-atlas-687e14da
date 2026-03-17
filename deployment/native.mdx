@@ -1,0 +1,98 @@
+---
+title: "Native build"
+description: "Build and run RadishDB directly on your machine using GCC and Make."
+---
+
+Building RadishDB natively gives you the shortest feedback loop for development and lets you dig into the source without a container layer in the way.
+
+## Prerequisites
+
+- **GCC** (version 13 recommended, though any recent version works)
+- **Make**
+- Linux or macOS
+
+<Tip>
+  Use the native build for development and local hacking. For production or server deployments, prefer the [Docker](/deployment/docker) or [Docker Compose](/deployment/docker-compose) options — they handle the runtime environment, port exposure, and data persistence for you.
+</Tip>
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/pie-314/RadishDB.git && cd RadishDB
+    ```
+  </Step>
+
+  <Step title="Build the binary">
+    Compile all source files and link the `radishdb` binary:
+
+    ```bash
+    make
+    ```
+
+    The Makefile compiles each `.c` file under `src/` into an object file in the `build/` directory, then links them into the `radishdb` executable in the project root. It uses the flags `-Wall -Wextra -Werror -g`, so all warnings are treated as errors.
+
+    **Available Makefile targets:**
+
+    | Target | Description |
+    |--------|-------------|
+    | `all` (default) | Compiles the project with standard flags and produces the `radishdb` binary |
+    | `clean` | Removes the `build/` directory and the `radishdb` binary |
+    | `asan` | Compiles with AddressSanitizer (`-fsanitize=address`) for memory error detection |
+  </Step>
+
+  <Step title="Run in REPL mode">
+    Launch an interactive REPL session:
+
+    ```bash
+    ./radishdb
+    ```
+
+    You can issue commands directly at the prompt, for example:
+
+    ```text
+    SET name radish
+    GET name
+    TTL name
+    ```
+  </Step>
+
+  <Step title="Run in server mode">
+    Start RadishDB as a TCP server listening on port 6379:
+
+    ```bash
+    ./radishdb --server
+    ```
+
+    Connect from another terminal using `nc`:
+
+    ```bash
+    nc localhost 6379
+    ```
+  </Step>
+
+  <Step title="Clean the build">
+    Remove all compiled artifacts:
+
+    ```bash
+    make clean
+    ```
+  </Step>
+</Steps>
+
+## ASAN build
+
+When debugging memory issues or writing new features, compile with AddressSanitizer:
+
+```bash
+make asan
+```
+
+ASAN instruments the binary to detect heap overflows, use-after-free bugs, and other memory errors at runtime. Run the resulting binary exactly as you would the standard build — any violations are reported to stderr with a full stack trace.
+
+<Warning>
+  The ASAN build is significantly slower than a standard build. Do not use it in production or performance benchmarks.
+</Warning>
+
+## AOF persistence
+
+When you run RadishDB natively, it writes its append-only file to `aof/radish.aof` relative to your current working directory. The directory is created automatically on first write. Data persists across process restarts as long as you run the binary from the same directory.

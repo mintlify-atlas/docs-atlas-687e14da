@@ -1,0 +1,52 @@
+---
+title: "SET"
+description: "Store a string value for a key, with optional TTL expiration."
+---
+
+## Syntax
+
+```text
+SET key value
+SET key value EX seconds
+```
+
+## Parameters
+
+<ParamField path="key" type="string" required>
+  The key to store. If the key already exists, its value and TTL are overwritten.
+</ParamField>
+
+<ParamField path="value" type="string" required>
+  The string value to associate with the key.
+</ParamField>
+
+<ParamField path="EX seconds" type="integer">
+  Set the key to expire after `seconds` seconds from the time of the command. Must be a non-negative integer. Omit this option to store the key without an expiration.
+</ParamField>
+
+## Returns
+
+`OK` on success. An error string if the wrong number of arguments is provided or the expiry value is invalid.
+
+## Behavior
+
+- If the key does not exist, it is created.
+- If the key already exists, its value is replaced and its TTL is reset (or cleared if `EX` is not given).
+- Before the in-memory state is updated, a `SET` record is appended to the append-only file (AOF), ensuring durability across restarts.
+
+<Note>
+  Overwriting an existing key with `SET` always resets its TTL. A key set without `EX` becomes persistent even if it previously had an expiration.
+</Note>
+
+## Examples
+
+```text
+SET name radish
+OK
+
+SET color red EX 10
+OK
+
+SET counter 42
+OK
+```

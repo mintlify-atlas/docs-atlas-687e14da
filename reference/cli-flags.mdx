@@ -1,0 +1,91 @@
+---
+title: "CLI flags"
+description: "Command-line flags for launching RadishDB in REPL or TCP server mode."
+---
+
+The `radishdb` binary supports a small set of flags that control its startup mode. When launched with no flags it drops into an interactive REPL. Pass `--server` (or `-s`) to start the TCP server instead.
+
+On startup, regardless of mode, RadishDB always:
+
+1. Opens and replays the AOF log at `aof/radish.aof` relative to the working directory.
+2. Rewrites the AOF if it has grown to more than twice its compacted base size.
+3. Initialises the TTL expiry system.
+
+## Flags
+
+<ParamField path="--server" type="boolean">
+  Start a TCP server on port 6379 instead of the interactive REPL. Listens for line-based text commands from any TCP client (e.g. `telnet`, `nc`, or a custom client).
+
+  Short form: `-s`
+</ParamField>
+
+<ParamField path="--version" type="boolean">
+  Print the version string and exit.
+
+  Short form: `-v`
+</ParamField>
+
+<ParamField path="--help" type="boolean">
+  Print a summary of supported database commands and exit.
+
+  Short form: `-h`
+</ParamField>
+
+## Default mode: REPL
+
+When no flags are provided, RadishDB starts an interactive REPL session.
+
+```bash
+./radishdb            # Start interactive REPL
+./radishdb --server   # Start TCP server on port 6379
+./radishdb -s         # Same as --server (short form)
+./radishdb --version  # Print version and exit
+./radishdb --help     # Print command reference and exit
+```
+
+## TCP server details
+
+| Property | Value |
+|---|---|
+| Port | `6379` |
+| Protocol | Line-based plain text |
+| Command format | Same as REPL (`SET key value`, `GET key`, etc.) |
+
+The server accepts one command per line and replies with a plain-text response.
+
+## AOF file path
+
+The AOF log path is hard-coded in `main.c` as `aof/radish.aof`, resolved relative to the process working directory. Ensure this directory exists before launching:
+
+```bash
+mkdir -p aof
+./radishdb --server
+```
+
+In the Docker image the working directory is `/app` and the `aof/` subdirectory is created at build time, so the log lands at `/app/aof/radish.aof`.
+
+## Docker
+
+The official image sets `--server` as the default `CMD`, so the container starts in server mode automatically.
+
+```bash
+# Server mode (default entrypoint — recommended)
+docker run -p 6379:6379 piee314/radishdb:latest
+
+# Override to REPL (not useful in a detached container)
+docker run -it piee314/radishdb:latest ./radishdb
+```
+
+To persist data across container restarts, mount a volume at `/app/aof`:
+
+```bash
+docker run -d \
+  --name radishdb \
+  -p 6379:6379 \
+  -v radish-data:/app/aof \
+  piee314/radishdb:latest
+```
+
+<Tip>
+Use `docker-compose up -d` with the provided `docker-compose.yml` to get the named volume, port binding, and `restart: unless-stopped` policy in one command.
+</Tip>
